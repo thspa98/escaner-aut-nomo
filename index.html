@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Motor QR Integrado - Corregido</title>
+    <title>Motor QR Blindado</title>
     <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #1a1a1a; color: white; padding-top: 20px; }
         video { border: 3px solid #00ff00; border-radius: 10px; max-width: 100%; height: auto; }
@@ -17,7 +17,7 @@
 </head>
 <body>
 
-    <h2>Motor QR Integrado</h2>
+    <h2>Motor QR Blindado</h2>
     <video id="video" width="400" height="400" autoplay playsinline></video>
     <canvas id="canvas" width="400" height="400" style="display:none;"></canvas>
     <div id="info">Iniciando cámara...</div>
@@ -43,7 +43,7 @@
                 if (res) {
                     info.innerText = "¡QR DETECTADO Y DECODIFICADO!";
                     divResultado.style.display = "block"; divResultado.innerText = res;
-                } else { info.innerText = "Analizando..."; }
+                } else { info.innerText = "Analizando entorno..."; }
             }
             requestAnimationFrame(escanear);
         }
@@ -69,7 +69,7 @@
             return bin;
         }
 
-        // FASE 2: DETECCIÓN Y AGRUPACIÓN POR PRODUCTO CRUZ VECTORIAL
+        // FASE 2: DETECCIÓN CON FILTRO CRUZADO VERTICAL
         function encontrarPatronesBusqueda(bin, w, h) {
             let centros = [];
             const verificar = (c) => {
@@ -84,7 +84,15 @@
                     else {
                         if(est===0||est===2) { est++; c[est]++; } 
                         else if(est===4) {
-                            if(verificar(c)) centros.push({x: Math.floor(x - c[4] - c[3] - c[2]/2), y});
+                            if(verificar(c)) {
+                                const cx = Math.floor(x - c[4] - c[3] - c[2]/2);
+                                // FILTRO VERTICAL EXPLEXO: Comprobar que el centro negro también sea simétrico verticalmente
+                                let cy = y, vBlk = 0;
+                                while (cy >= 0 && bin[cy*w+cx] === 0) { vBlk++; cy--; }
+                                cy = y + 1;
+                                while (cy < h && bin[cy*w+cx] === 0) { vBlk++; cy++; }
+                                if (Math.abs(vBlk - c[2]) < c[2] * 0.5) centros.push({x: cx, y});
+                            }
                             c[0]=c[2]; c[1]=c[3]; c[2]=c[4]; c[3]=1; c[4]=0; est=3;
                         } else c[est]++;
                     }
@@ -93,6 +101,7 @@
             return centros;
         }
 
+        // FILTRO GEOMÉTRICO BASADO EN PITÁGORAS (ELIMINA TEXTO DE PANTALLA)
         function agruparYOrdenarMarcadores(puntos) {
             if (puntos.length < 3) return null;
             let clusters = [];
@@ -105,22 +114,27 @@
             
             let [p1, p2, p3] = clusters.slice(0,3);
             let d12 = Math.hypot(p1.x-p2.x, p1.y-p2.y), d23 = Math.hypot(p2.x-p3.x, p2.y-p3.y), d31 = Math.hypot(p3.x-p1.x, p3.y-p1.y);
-            let topLeft, topRight, bottomLeft;
+            let topLeft, topRight, bottomLeft, leg1, leg2, hipo;
 
-            // Determinar vértice del ángulo recto (Top-Left) y usar Producto Cruz para orientar los otros dos
-            if (d12 > d23 && d12 > d31) {
-                topLeft = p3;
+            let maxDist = Math.max(d12, d23, d31);
+            if (maxDist === d12) {
+                topLeft = p3; leg1 = d23; leg2 = d31; hipo = d12;
                 let cross = (p1.x - p3.x) * (p2.y - p3.y) - (p1.y - p3.y) * (p2.x - p3.x);
                 if (cross > 0) { topRight = p1; bottomLeft = p2; } else { topRight = p2; bottomLeft = p1; }
-            } else if (d23 > d12 && d23 > d31) {
-                topLeft = p1;
+            } else if (maxDist === d23) {
+                topLeft = p1; leg1 = d12; leg2 = d31; hipo = d23;
                 let cross = (p2.x - p1.x) * (p3.y - p1.y) - (p2.y - p1.y) * (p3.x - p1.x);
                 if (cross > 0) { topRight = p2; bottomLeft = p3; } else { topRight = p3; bottomLeft = p2; }
             } else {
-                topLeft = p2;
+                topLeft = p2; leg1 = d12; leg2 = d23; hipo = d31;
                 let cross = (p1.x - p2.x) * (p3.y - p2.y) - (p1.y - p2.y) * (p3.x - p2.x);
                 if (cross > 0) { topRight = p1; bottomLeft = p3; } else { topRight = p3; bottomLeft = p1; }
             }
+
+            // VALIDACIÓN PITAGÓRICA: Los lados deben ser similares y cumplir leg1² + leg2² ≈ hipo²
+            if (Math.abs(leg1 - leg2) / Math.max(leg1, leg2) > 0.35) return null;
+            if (Math.abs((leg1*leg1 + leg2*leg2) - hipo*hipo) / (hipo*hipo) > 0.35) return null;
+
             return { topLeft, topRight, bottomLeft };
         }
 
@@ -202,7 +216,7 @@
             return false;
         }
 
-        // REED-SOLOMON MATEMÁTICO REAL
+        // REED-SOLOMON REAL
         const exp = new Uint8Array(512), log = new Uint8Array(256);
         let val = 1;
         for (let i = 0; i < 255; i++) { exp[i] = val; log[val] = i; val <<= 1; if (val & 0x100) val ^= 285; }
@@ -242,12 +256,16 @@
             return msg.slice(0, msg.length - nCorr);
         }
 
+        // CONTROL SILENCIOSO DE ERRORES DE FILTRADO
         function decodificarTextoReal(bytes) {
-            if (bytes.length < 2) return "";
+            if (bytes.length < 2) return null;
             let modo = (bytes[0] >> 4) & 0x0F;
             let len = ((bytes[0] & 0x0F) << 4) | ((bytes[1] >> 4) & 0x0F);
+            
+            // Si no es modo byte estructurado o la longitud excede la memoria física del QR, es un falso positivo.
+            if (modo !== 4 || len === 0 || len > bytes.length - 2) return null; 
+            
             let res = "", bitIdx = 12;
-            if (modo !== 4) return "Modo no soportado (usa texto estándar)"; 
             for (let i = 0; i < len; i++) {
                 let b = 0;
                 for (let j = 0; j < 8; j++) {
@@ -260,7 +278,7 @@
             return res;
         }
 
-        // FASE 5: CONTROLADOR PRINCIPAL
+        // FASE 5: CONTROLADOR PRINCIPAL CON VERIFICACIÓN INTEGRAL
         function procesarQR(pixeles, w, h) {
             try {
                 const bin = binarizarImagen(pixeles, w, h);
@@ -281,7 +299,7 @@
                 const nCorr = [7, 10, 13, 17][ecLevel] || 7;
                 const bytesCorregidos = corregirErroresReedSolomonReal(bytesCrudos, nCorr);
                 
-                return decodificarTextoReal(bytesCorregidos);
+                return decodificarTextoReal(bytesCorregidos); // Devolverá null si no es un QR legítimo
             } catch (e) { return null; }
         }
     </script>
