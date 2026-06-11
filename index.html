@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Motor QR Desde Cero</title>
+    <title>Motor QR Integrado</title>
     <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #1a1a1a; color: white; padding-top: 20px; }
         video { border: 3px solid #00ff00; border-radius: 10px; transform: scaleX(-1); max-width: 100%; height: auto; }
@@ -18,337 +18,264 @@
 <body>
 
     <h2>Motor QR Integrado</h2>
-    
     <video id="video" width="400" height="400" autoplay playsinline></video>
     <canvas id="canvas" width="400" height="400" style="display:none;"></canvas>
-    
     <div id="info">Iniciando cámara...</div>
     <div id="resultado"></div>
 
     <script>
-        // =====================================================================
-        // CONFIGURACIÓN DE CÁMARA Y BUCLE PRINCIPAL
-        // =====================================================================
         const video = document.getElementById('video');
         const canvas = document.getElementById('canvas');
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         const info = document.getElementById('info');
         const divResultado = document.getElementById('resultado');
 
-        // Acceso a la cámara
         navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-            .then(function(stream) {
-                video.srcObject = stream;
-                video.addEventListener('loadeddata', escanearFrame);
-            })
-            .catch(function(err) {
-                info.innerText = "Error al acceder a la cámara.";
-                console.error(err);
-            });
+            .then(s => { video.srcObject = s; video.addEventListener('loadeddata', escanear); })
+            .catch(() => info.innerText = "Error al acceder a la cámara.");
 
-        // Bucle de escaneo constante
-        function escanearFrame() {
+        function escanear() {
             if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth; canvas.height = video.videoHeight;
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                
-                // Llamamos a nuestro controlador principal
-                const resultado = procesarQR(imageData.data, canvas.width, canvas.height);
-                
-                if (resultado) {
+                const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const res = procesarQR(img.data, canvas.width, canvas.height);
+                if (res) {
                     info.innerText = "¡QR DETECTADO Y DECODIFICADO!";
-                    divResultado.style.display = "block";
-                    divResultado.innerText = resultado;
-                } else {
-                    info.innerText = `Analizando...`;
-                }
+                    divResultado.style.display = "block"; divResultado.innerText = res;
+                } else { info.innerText = "Analizando..."; }
             }
-            requestAnimationFrame(escanearFrame);
+            requestAnimationFrame(escanear);
         }
 
-        // =====================================================================
-        // FASE 1: BINARIZACIÓN CON UMBRAL ADAPTATIVO
-        // =====================================================================
-        function binarizarImagen(pixeles, width, height) {
-            const totalPixeles = width * height;
-            const gris = new Uint8Array(totalPixeles);
-            const matrizBinaria = new Uint8Array(totalPixeles);
-            const integral = new Uint32Array(totalPixeles);
-            
-            for (let i = 0; i < pixeles.length; i += 4) {
-                gris[i / 4] = (pixeles[i] * 0.299) + (pixeles[i + 1] * 0.587) + (pixeles[i + 2] * 0.114);
+        // FASE 1: BINARIZACIÓN ADAPTATIVA (BRADLEY-ROTH)
+        function binarizarImagen(pixeles, w, h) {
+            const gris = new Uint8Array(w * h), bin = new Uint8Array(w * h), int = new Uint32Array(w * h);
+            for (let i = 0; i < pixeles.length; i += 4) gris[i/4] = pixeles[i]*0.299 + pixeles[i+1]*0.587 + pixeles[i+2]*0.114;
+            for (let x = 0; x < w; x++) {
+                let col = 0;
+                for (let y = 0; y < h; y++) { const idx = y*w+x; col += gris[idx]; int[idx] = (x === 0) ? col : int[idx-1] + col; }
             }
-            
-            for (let x = 0; x < width; x++) {
-                let sumaColumna = 0;
-                for (let y = 0; y < height; y++) {
-                    const indice = y * width + x;
-                    sumaColumna += gris[indice];
-                    if (x === 0) {
-                        integral[indice] = sumaColumna;
-                    } else {
-                        integral[indice] = integral[indice - 1] + sumaColumna;
+            const S = Math.floor(w / 8), t = 0.15;
+            for (let x = 0; x < w; x++) {
+                for (let y = 0; y < h; y++) {
+                    const idx = y*w+x, x1 = Math.max(0, x-Math.floor(S/2)), x2 = Math.min(w-1, x+Math.floor(S/2));
+                    const y1 = Math.max(0, y-Math.floor(S/2)), y2 = Math.min(h-1, y+Math.floor(S/2));
+                    const count = (x2-x1) * (y2-y1);
+                    const sum = int[y2*w+x2] - int[y1*w+x2] - int[y2*w+x1] + int[y1*w+x1];
+                    bin[idx] = (gris[idx] * count < sum * (1.0 - t)) ? 0 : 1;
+                }
+            }
+            return bin;
+        }
+
+        // FASE 2: DETECCIÓN Y AGRUPACIÓN DE FINDER PATTERNS
+        function encontrarPatronesBusqueda(bin, w, h) {
+            let centros = [];
+            const verificar = (c) => {
+                const tot = c.reduce((a,b)=>a+b,0); if(tot<7) return false;
+                const m = tot/7.0, v = m/2.0;
+                return Math.abs(m-c[0])<v && Math.abs(m-c[1])<v && Math.abs(3*m-c[2])<3*v && Math.abs(m-c[3])<v && Math.abs(m-c[4])<v;
+            };
+            for (let y = 0; y < h; y++) {
+                let c = [0,0,0,0,0], est = 0;
+                for (let x = 0; x < w; x++) {
+                    if (bin[y*w+x] === 0) { if(est===1||est===3) est++; c[est]++; } 
+                    else {
+                        if(est===0||est===2) { est++; c[est]++; } 
+                        else if(est===4) {
+                            if(verificar(c)) centros.push({x: Math.floor(x - c[4] - c[3] - c[2]/2), y});
+                            c[0]=c[2]; c[1]=c[3]; c[2]=c[4]; c[3]=1; c[4]=0; est=3;
+                        } else c[est]++;
                     }
                 }
             }
-            
-            const S = Math.floor(width / 8); 
-            const t = 0.15;                 
-            
-            for (let x = 0; x < width; x++) {
-                for (let y = 0; y < height; y++) {
-                    const indice = y * width + x;
-                    const x1 = Math.max(0, x - Math.floor(S / 2));
-                    const x2 = Math.min(width - 1, x + Math.floor(S / 2));
-                    const y1 = Math.max(0, y - Math.floor(S / 2));
-                    const y2 = Math.min(height - 1, y + Math.floor(S / 2));
-                    const cantidadPixeles = (x2 - x1) * (y2 - y1);
-                    const sumaRegion = integral[y2 * width + x2] - integral[y1 * width + x2] - integral[y2 * width + x1] + integral[y1 * width + x1];
-                    
-                    if ((gris[indice] * cantidadPixeles) < (sumaRegion * (1.0 - t))) {
-                        matrizBinaria[indice] = 0; 
-                    } else {
-                        matrizBinaria[indice] = 1; 
-                    }
-                }
-            }
-            return matrizBinaria;
+            return centros;
         }
 
-        // =====================================================================
-        // FASE 2: DETECCIÓN DE PATRONES DE BÚSQUEDA
-        // =====================================================================
-        function encontrarPatronesBusqueda(matrizBinaria, width, height) {
-            const posiblesCentros = [];
-
-            function verificarProporcion(conteo) {
-                const tamañoTotal = conteo[0] + conteo[1] + conteo[2] + conteo[3] + conteo[4];
-                if (tamañoTotal < 7) return false;
-                const modulo = tamañoTotal / 7.0;
-                const varianza = modulo / 2.0; 
-                return Math.abs(modulo - conteo[0]) < varianza && Math.abs(modulo - conteo[1]) < varianza && Math.abs(3 * modulo - conteo[2]) < 3 * varianza && Math.abs(modulo - conteo[3]) < varianza && Math.abs(modulo - conteo[4]) < varianza;
-            }
-
-            for (let y = 0; y < height; y++) {
-                let conteo = [0, 0, 0, 0, 0];
-                let estado = 0; 
-                
-                for (let x = 0; x < width; x++) {
-                    const esNegro = (matrizBinaria[y * width + x] === 0);
-
-                    if (esNegro) {
-                        if (estado === 1 || estado === 3) estado++;
-                        conteo[estado]++;
-                    } else { 
-                        if (estado === 0 || estado === 2) {
-                            estado++;
-                            conteo[estado]++;
-                        } else if (estado === 4) {
-                            if (verificarProporcion(conteo)) {
-                                const centroX = x - conteo[4] - conteo[3] - (conteo[2] / 2);
-                                posiblesCentros.push({ x: Math.floor(centroX), y: y });
-                            }
-                            conteo[0] = conteo[2];
-                            conteo[1] = conteo[3];
-                            conteo[2] = conteo[4];
-                            conteo[3] = 1;
-                            conteo[4] = 0;
-                            estado = 3;
-                        } else {
-                            conteo[estado]++;
-                        }
-                    }
-                }
-            }
-            return posiblesCentros;
+        function agruparYOrdenarMarcadores(puntos) {
+            if (puntos.length < 3) return null;
+            let clusters = [];
+            puntos.forEach(p => {
+                let f = clusters.find(c => Math.hypot(c.x-p.x, c.y-p.y) < 15);
+                if(f) { f.x = (f.x+p.x)/2; f.y = (f.y+p.y)/2; f.n++; } else clusters.push({...p, n:1});
+            });
+            clusters = clusters.filter(c => c.n > 1).sort((a,b)=>b.n-a.n);
+            if(clusters.length < 3) return null;
+            
+            let [p1, p2, p3] = clusters.slice(0,3);
+            let d12 = Math.hypot(p1.x-p2.x, p1.y-p2.y), d23 = Math.hypot(p2.x-p3.x, p2.y-p3.y), d31 = Math.hypot(p3.x-p1.x, p3.y-p1.y);
+            let topLeft, topRight, bottomLeft;
+            if (d12 > d23 && d12 > d31) { topLeft = p3; if(p1.x<p2.x) { bottomLeft=p1; topRight=p2; } else { bottomLeft=p2; topRight=p1; } }
+            else if (d23 > d12 && d23 > d31) { topLeft = p1; if(p2.x<p3.x) { bottomLeft=p2; topRight=p3; } else { bottomLeft=p3; topRight=p2; } }
+            else { topLeft = p2; if(p1.x<p3.x) { bottomLeft=p1; topRight=p3; } else { bottomLeft=p3; topRight=p1; } }
+            return { topLeft, topRight, bottomLeft };
         }
 
-        // =====================================================================
-        // FASE 3: ÁLGEBRA LINEAL - CORRECCIÓN DE PERSPECTIVA
-        // =====================================================================
+        // FASE 3: HOMOGRAFÍA Y EXTRACCIÓN DE MATRIZ
         function calcularMatrizPerspectiva(p1, p2, p3, p4, size) {
-            const dx1 = p2.x - p3.x, dy1 = p2.y - p3.y;
-            const dx2 = p4.x - p3.x, dy2 = p4.y - p3.y;
-            const dx3 = p1.x - p2.x + p3.x - p4.x, dy3 = p1.y - p2.y + p3.y - p4.y;
+            const dx1 = p2.x-p3.x, dy1 = p2.y-p3.y, dx2 = p4.x-p3.x, dy2 = p4.y-p3.y;
+            const dx3 = p1.x-p2.x+p3.x-p4.x, dy3 = p1.y-p2.y+p3.y-p4.y;
             let a11, a12, a13, a21, a22, a23, a31, a32;
-
             if (dx3 === 0 && dy3 === 0) {
-                a11 = p2.x - p1.x; a21 = p4.x - p1.x; a31 = p1.x;
-                a12 = p2.y - p1.y; a22 = p4.y - p1.y; a32 = p1.y;
-                a13 = 0;           a23 = 0;
+                a11 = p2.x-p1.x; a21 = p4.x-p1.x; a31 = p1.x; a12 = p2.y-p1.y; a22 = p4.y-p1.y; a32 = p1.y; a13 = 0; a23 = 0;
             } else {
-                const det = (dx1 * dy2) - (dx2 * dy1);
-                a13 = ((dx3 * dy2) - (dx2 * dy3)) / det;
-                a23 = ((dx1 * dy3) - (dx3 * dy1)) / det;
-                a11 = p2.x - p1.x + a13 * p2.x;
-                a21 = p4.x - p1.x + a23 * p4.x;
-                a31 = p1.x;
-                a12 = p2.y - p1.y + a13 * p2.y;
-                a22 = p4.y - p1.y + a23 * p4.y;
-                a32 = p1.y;
+                const det = dx1*dy2 - dx2*dy1;
+                a13 = (dx3*dy2 - dx2*dy3)/det; a23 = (dx1*dy3 - dx3*dy1)/det;
+                a11 = p2.x-p1.x + a13*p2.x; a21 = p4.x-p1.x + a23*p4.x; a31 = p1.x;
+                a12 = p2.y-p1.y + a13*p2.y; a22 = p4.y-p1.y + a23*p4.y; a32 = p1.y;
             }
-
-            return [
-                a11 / size, a21 / size, a31,
-                a12 / size, a22 / size, a32,
-                a13 / size, a23 / size, 1.0
-            ];
+            return [a11/size, a21/size, a31, a12/size, a22/size, a32, a13/size, a23/size, 1];
         }
 
-        function extraerCuadricula(matrizBinaria, width, height, homografia, size) {
-            const cuadriculaPerfecta = new Uint8Array(size * size);
-            const [m11, m12, m13, m21, m22, m23, m31, m32, m33] = homografia;
-
+        function extraerCuadricula(bin, w, h, m, size) {
+            const grid = new Uint8Array(size * size);
             for (let y = 0; y < size; y++) {
                 for (let x = 0; x < size; x++) {
-                    const denominador = (m31 * x) + (m32 * y) + m33;
-                    const origenX = Math.floor(((m11 * x) + (m12 * y) + m13) / denominador);
-                    const origenY = Math.floor(((m21 * x) + (m22 * y) + m23) / denominador);
-
-                    if (origenX >= 0 && origenX < width && origenY >= 0 && origenY < height) {
-                        cuadriculaPerfecta[y * size + x] = matrizBinaria[origenY * width + origenX];
-                    } else {
-                        cuadriculaPerfecta[y * size + x] = 1;
-                    }
+                    const den = m[6]*x + m[7]*y + m[8];
+                    const ox = Math.floor((m[0]*x + m[1]*y + m[2])/den), oy = Math.floor((m[3]*x + m[4]*y + m[5])/den);
+                    grid[y*size+x] = (ox>=0 && ox<w && oy>=0 && oy<h) ? bin[oy*w+ox] : 1;
                 }
             }
-            return cuadriculaPerfecta;
+            return grid;
         }
 
-        // =====================================================================
-        // FASE 4: EXTRACCIÓN EN ZIG-ZAG Y CORRECCIÓN REED-SOLOMON
-        // =====================================================================
-        function desenmascarar(cuadricula, size, patronMascara) {
+        // FASE 4: DESENMASCARADO, MÁSCARAS Y LECTURA FORMATO REAL
+        function leerInformacionFormatoReal(grid, size) {
+            let bits = 0;
+            for (let i = 0; i < 6; i++) bits = (bits << 1) | grid[8*size+i];
+            bits = (bits << 1) | grid[8*size+7]; bits = (bits << 1) | grid[8*size+8]; bits = (bits << 1) | grid[7*size+8];
+            for (let i = 5; i >= 0; i--) bits = (bits << 1) | grid[i*size+8];
+            bits ^= 0x5415; // Máscara XOR estándar de formato
+            return { ecLevel: (bits >> 13) & 3, maskPattern: (bits >> 10) & 7 };
+        }
+
+        function desenmascarar(grid, size, mask) {
             for (let y = 0; y < size; y++) {
                 for (let x = 0; x < size; x++) {
-                    let invertir = false;
-                    switch (patronMascara) {
-                        case 0: invertir = (y + x) % 2 === 0; break;
-                        case 1: invertir = y % 2 === 0; break;
-                        case 2: invertir = x % 3 === 0; break;
-                        case 3: invertir = (y + x) % 3 === 0; break;
-                        case 4: invertir = (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0; break;
-                        case 5: invertir = ((y * x) % 2) + ((y * x) % 3) === 0; break;
-                        case 6: invertir = (((y * x) % 2) + ((y * x) % 3)) % 2 === 0; break;
-                        case 7: invertir = (((y + x) % 2) + ((y * x) % 3)) % 2 === 0; break;
+                    let inv = false;
+                    switch (mask) {
+                        case 0: inv = (y + x) % 2 === 0; break; case 1: inv = y % 2 === 0; break;
+                        case 2: inv = x % 3 === 0; break; case 3: inv = (y + x) % 3 === 0; break;
+                        case 4: inv = (Math.floor(y/2) + Math.floor(x/3)) % 2 === 0; break;
+                        case 5: inv = ((y * x) % 2) + ((y * x) % 3) === 0; break;
+                        case 6: inv = (((y * x) % 2) + ((y * x) % 3)) % 2 === 0; break;
+                        case 7: inv = (((y + x) % 2) + ((y * x) % 3)) % 2 === 0; break;
                     }
-                    if (invertir) cuadricula[y * size + x] ^= 1; 
+                    if (inv && !esZonaDePatron(x, y, size)) grid[y*size+x] ^= 1;
                 }
             }
         }
 
-        function extraerBytes(cuadricula, size) {
-            const bytes = [];
-            let byteActual = 0, bitsLeidos = 0, direccionArriba = true, x = size - 1, y = size - 1;
-
+        function extraerBytes(grid, size) {
+            const bytes = []; let bAct = 0, bLeidos = 0, up = true, x = size-1, y = size-1;
             while (x > 0) {
                 if (x === 6) x--;
                 for (let i = 0; i < 2; i++) {
                     const col = x - i;
                     if (!esZonaDePatron(col, y, size)) {
-                        const bit = cuadricula[y * size + col] === 0 ? 1 : 0;
-                        byteActual = (byteActual << 1) | bit;
-                        bitsLeidos++;
-                        if (bitsLeidos === 8) {
-                            bytes.push(byteActual);
-                            byteActual = 0;
-                            bitsLeidos = 0;
-                        }
+                        bAct = (bAct << 1) | (grid[y*size+col] === 0 ? 1 : 0); bLeidos++;
+                        if (bLeidos === 8) { bytes.push(bAct); bAct = 0; bLeidos = 0; }
                     }
                 }
-                if (direccionArriba) {
-                    y--;
-                    if (y < 0) { y = 0; x -= 2; direccionArriba = false; }
-                } else {
-                    y++;
-                    if (y >= size) { y = size - 1; x -= 2; direccionArriba = true; }
-                }
+                if (up) { y--; if (y < 0) { y = 0; x -= 2; up = false; } } 
+                else { y++; if (y >= size) { y = size - 1; x -= 2; up = true; } }
             }
             return bytes;
         }
 
         function esZonaDePatron(x, y, size) {
-            if (x < 9 && y < 9) return true; 
-            if (x >= size - 9 && y < 9) return true; 
-            if (x < 9 && y >= size - 9) return true; 
+            if (x < 9 && y < 9) return true; if (x >= size - 8 && y < 9) return true; if (x < 9 && y >= size - 8) return true;
+            if (x >= size - 9 && x <= size - 5 && y >= size - 9 && y <= size - 5) return true; // Alignment v1
             return false;
         }
 
-        const gfExp = new Uint8Array(512), gfLog = new Uint8Array(256);
-        let expX = 1;
-        for (let i = 0; i < 255; i++) {
-            gfExp[i] = expX; gfLog[expX] = i; expX <<= 1;
-            if (expX & 0x100) expX ^= 285;
-        }
-        for (let i = 255; i < 512; i++) gfExp[i] = gfExp[i - 255];
+        // REED-SOLOMON REAL (CAMPOS DE GALOIS GF(256) + BERLEKAMP-MASSEY CORRECCIÓN)
+        const exp = new Uint8Array(512), log = new Uint8Array(256);
+        let val = 1;
+        for (let i = 0; i < 255; i++) { exp[i] = val; log[val] = i; val <<= 1; if (val & 0x100) val ^= 285; }
+        for (let i = 255; i < 512; i++) exp[i] = exp[i-255];
+        
+        const gfMul = (a, b) => (a === 0 || b === 0) ? 0 : exp[log[a] + log[b]];
 
-        function corregirErroresReedSolomon(mensaje, numSimbolosCorreccion) {
-            let sindromes = new Array(numSimbolosCorreccion).fill(0);
-            let hayErrores = false;
-            for (let i = 0; i < numSimbolosCorreccion; i++) {
-                let evalPolinomio = 0;
-                for (let j = 0; j < mensaje.length; j++) {
-                    evalPolinomio = mensaje[j] ^ (evalPolinomio === 0 ? 0 : gfExp[gfLog[evalPolinomio] + i]);
+        function corregirErroresReedSolomonReal(msg, nCorr) {
+            let syn = new Array(nCorr).fill(0), err = false;
+            for (let i = 0; i < nCorr; i++) {
+                let e = 0; for (let j = 0; j < msg.length; j++) e = msg[j] ^ gfMul(e, exp[i]);
+                syn[i] = e; if (e !== 0) err = true;
+            }
+            if (!err) return msg.slice(0, msg.length - nCorr);
+
+            // Algoritmo Berlekamp-Massey completo incorporado para resolver localizaciones
+            let C = new Array(nCorr + 1).fill(0), B = new Array(nCorr + 1).fill(0); C[0] = 1; B[0] = 1;
+            let L = 0, m = 1, b = 1;
+            for (let i = 0; i < nCorr; i++) {
+                let d = syn[i];
+                for (let j = 1; j <= L; j++) d ^= gfMul(C[j], syn[i - j]);
+                if (d === 0) m++;
+                else {
+                    let T = [...C]; let coef = gfMul(d, exp[255 - log[b]]);
+                    for (let j = 0; j + m < C.length; j++) C[j + m] ^= gfMul(coef, B[j]);
+                    if (2 * L <= i) { L = i + 1 - L; B = T; b = d; m = 1; } else m++;
                 }
-                sindromes[i] = evalPolinomio;
-                if (evalPolinomio !== 0) hayErrores = true;
             }
-            return mensaje.slice(0, mensaje.length - numSimbolosCorreccion); 
+            // Localizar raíces mediante búsqueda de Chien y reparar magnitudes con Forney
+            let raices = [];
+            for (let i = 0; i < 255; i++) {
+                let evalC = 0; for (let j = 0; j <= L; j++) evalC ^= gfMul(C[j], exp[(j * i) % 255]);
+                if (evalC === 0) { let idx = msg.length - 1 - (255 - i); if(idx >= 0 && idx < msg.length) raices.push(idx); }
+            }
+            raices.forEach(pos => {
+                let xi = exp[255 - (msg.length - 1 - pos)], num = 0, den = 0;
+                for (let j = 0; j < nCorr; j++) num ^= gfMul(syn[j], (j===0?1:exp[(j*(255-log[xi]))%255]));
+                for (let j = 1; j <= L; j += 2) den ^= gfMul(C[j], exp[((j-1)*(255-log[xi]))%255]);
+                if (den !== 0) msg[pos] ^= gfMul(num, exp[255 - log[den]]);
+            });
+            return msg.slice(0, msg.length - nCorr);
         }
 
-        function decodificarTexto(bytesCorregidos) {
-            let texto = "";
-            for (let i = 0; i < bytesCorregidos.length; i++) {
-                texto += String.fromCharCode(bytesCorregidos[i]);
+        function decodificarTextoReal(bytes) {
+            if (bytes.length < 2) return "";
+            let modo = (bytes[0] >> 4) & 0x0F;
+            let len = ((bytes[0] & 0x0F) << 4) | ((bytes[1] >> 4) & 0x0F);
+            let res = "", bitIdx = 12;
+            if (modo !== 4) return "Modo no soportado (usa texto estándar)"; // Filtro modo Byte
+            for (let i = 0; i < len; i++) {
+                let b = 0;
+                for (let j = 0; j < 8; j++) {
+                    let bytePos = Math.floor(bitIdx / 8), bitPos = 7 - (bitIdx % 8);
+                    if (bytePos < bytes.length) b |= ((bytes[bytePos] >> bitPos) & 1) << (7 - j);
+                    bitIdx++;
+                }
+                res += String.fromCharCode(b);
             }
-            return texto;
+            return res;
         }
 
-        // =====================================================================
-        // FASE 5: CONTROLADOR PRINCIPAL Y FUNCIONES AUXILIARES
-        // =====================================================================
-        function procesarQR(pixeles, width, height) {
+        // FASE 5: CONTROLADOR PRINCIPAL
+        function procesarQR(pixeles, w, h) {
             try {
-                const matrizBinaria = binarizarImagen(pixeles, width, height);
-                const posiblesCentros = encontrarPatronesBusqueda(matrizBinaria, width, height);
-
-                if (posiblesCentros.length < 3) return null;
-
-                const marcadores = agruparYOrdenarMarcadores(posiblesCentros);
+                const bin = binarizarImagen(pixeles, w, h);
+                const centros = encontrarPatronesBusqueda(bin, w, h);
+                const marcadores = agruparYOrdenarMarcadores(centros);
                 if (!marcadores) return null;
 
                 const { topLeft, topRight, bottomLeft } = marcadores;
-                const bottomRight = {
-                    x: topRight.x - topLeft.x + bottomLeft.x,
-                    y: topRight.y - topLeft.y + bottomLeft.y
-                };
-
-                const dimensionModulos = estimarDimension(topLeft, topRight, bottomLeft);
-                const matrizHomografia = calcularMatrizPerspectiva(topLeft, topRight, bottomRight, bottomLeft, dimensionModulos);
-                const cuadriculaAlineada = extraerCuadricula(matrizBinaria, width, height, matrizHomografia, dimensionModulos);
-                const { patronMascara, nivelCorreccion } = leerInformacionFormato(cuadriculaAlineada, dimensionModulos);
+                const bottomRight = { x: topRight.x - topLeft.x + bottomLeft.x, y: topRight.y - topLeft.y + bottomLeft.y };
                 
-                desenmascarar(cuadriculaAlineada, dimensionModulos, patronMascara);
+                // Módulo v1 estándar matemático = 21 módulos
+                const homografia = calcularMatrizPerspectiva(topLeft, topRight, bottomRight, bottomLeft, 21);
+                const grid = extraerCuadricula(bin, w, h, homografia, 21);
                 
-                const bytesCrudos = extraerBytes(cuadriculaAlineada, dimensionModulos);
-                const bytesCorregidos = corregirErroresReedSolomon(bytesCrudos, nivelCorreccion);
+                const { maskPattern, ecLevel } = leerInformacionFormatoReal(grid, 21);
+                desenmascarar(grid, 21, maskPattern);
                 
-                return decodificarTexto(bytesCorregidos);
-            } catch (error) {
-                return null;
-            }
-        }
-
-        function agruparYOrdenarMarcadores(centros) {
-            return { topLeft: centros[0], topRight: centros[1], bottomLeft: centros[2] };
-        }
-
-        function estimarDimension(p1, p2, p3) {
-            return 21; 
-        }
-
-        function leerInformacionFormato(cuadricula, size) {
-            return { patronMascara: 0, nivelCorreccion: 7 };
+                const bytesCrudos = extraerBytes(grid, 21);
+                const nCorr = [7, 10, 13, 17][ecLevel] || 7;
+                const bytesCorregidos = corregirErroresReedSolomonReal(bytesCrudos, nCorr);
+                
+                return decodificarTextoReal(bytesCorregidos);
+            } catch (e) { return null; }
         }
     </script>
 </body>
