@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Motor QR Integrado</title>
+    <title>Motor QR Integrado - Corregido</title>
     <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #1a1a1a; color: white; padding-top: 20px; }
-        video { border: 3px solid #00ff00; border-radius: 10px; transform: scaleX(-1); max-width: 100%; height: auto; }
+        video { border: 3px solid #00ff00; border-radius: 10px; max-width: 100%; height: auto; }
         #info { margin-top: 15px; font-family: monospace; color: #00ff00; font-size: 1.2em; }
         #resultado { 
             margin: 20px auto; padding: 15px; background: #2a2a2a; 
@@ -69,7 +69,7 @@
             return bin;
         }
 
-        // FASE 2: DETECCIÓN Y AGRUPACIÓN DE FINDER PATTERNS
+        // FASE 2: DETECCIÓN Y AGRUPACIÓN POR PRODUCTO CRUZ VECTORIAL
         function encontrarPatronesBusqueda(bin, w, h) {
             let centros = [];
             const verificar = (c) => {
@@ -106,9 +106,21 @@
             let [p1, p2, p3] = clusters.slice(0,3);
             let d12 = Math.hypot(p1.x-p2.x, p1.y-p2.y), d23 = Math.hypot(p2.x-p3.x, p2.y-p3.y), d31 = Math.hypot(p3.x-p1.x, p3.y-p1.y);
             let topLeft, topRight, bottomLeft;
-            if (d12 > d23 && d12 > d31) { topLeft = p3; if(p1.x<p2.x) { bottomLeft=p1; topRight=p2; } else { bottomLeft=p2; topRight=p1; } }
-            else if (d23 > d12 && d23 > d31) { topLeft = p1; if(p2.x<p3.x) { bottomLeft=p2; topRight=p3; } else { bottomLeft=p3; topRight=p2; } }
-            else { topLeft = p2; if(p1.x<p3.x) { bottomLeft=p1; topRight=p3; } else { bottomLeft=p3; topRight=p1; } }
+
+            // Determinar vértice del ángulo recto (Top-Left) y usar Producto Cruz para orientar los otros dos
+            if (d12 > d23 && d12 > d31) {
+                topLeft = p3;
+                let cross = (p1.x - p3.x) * (p2.y - p3.y) - (p1.y - p3.y) * (p2.x - p3.x);
+                if (cross > 0) { topRight = p1; bottomLeft = p2; } else { topRight = p2; bottomLeft = p1; }
+            } else if (d23 > d12 && d23 > d31) {
+                topLeft = p1;
+                let cross = (p2.x - p1.x) * (p3.y - p1.y) - (p2.y - p1.y) * (p3.x - p1.x);
+                if (cross > 0) { topRight = p2; bottomLeft = p3; } else { topRight = p3; bottomLeft = p2; }
+            } else {
+                topLeft = p2;
+                let cross = (p1.x - p2.x) * (p3.y - p2.y) - (p1.y - p2.y) * (p3.x - p2.x);
+                if (cross > 0) { topRight = p1; bottomLeft = p3; } else { topRight = p3; bottomLeft = p1; }
+            }
             return { topLeft, topRight, bottomLeft };
         }
 
@@ -140,13 +152,13 @@
             return grid;
         }
 
-        // FASE 4: DESENMASCARADO, MÁSCARAS Y LECTURA FORMATO REAL
+        // FASE 4: DESENMASCARADO Y LECTURA FORMATO REAL
         function leerInformacionFormatoReal(grid, size) {
             let bits = 0;
             for (let i = 0; i < 6; i++) bits = (bits << 1) | grid[8*size+i];
             bits = (bits << 1) | grid[8*size+7]; bits = (bits << 1) | grid[8*size+8]; bits = (bits << 1) | grid[7*size+8];
             for (let i = 5; i >= 0; i--) bits = (bits << 1) | grid[i*size+8];
-            bits ^= 0x5415; // Máscara XOR estándar de formato
+            bits ^= 0x5415; 
             return { ecLevel: (bits >> 13) & 3, maskPattern: (bits >> 10) & 7 };
         }
 
@@ -186,16 +198,15 @@
 
         function esZonaDePatron(x, y, size) {
             if (x < 9 && y < 9) return true; if (x >= size - 8 && y < 9) return true; if (x < 9 && y >= size - 8) return true;
-            if (x >= size - 9 && x <= size - 5 && y >= size - 9 && y <= size - 5) return true; // Alignment v1
+            if (x >= size - 9 && x <= size - 5 && y >= size - 9 && y <= size - 5) return true; 
             return false;
         }
 
-        // REED-SOLOMON REAL (CAMPOS DE GALOIS GF(256) + BERLEKAMP-MASSEY CORRECCIÓN)
+        // REED-SOLOMON MATEMÁTICO REAL
         const exp = new Uint8Array(512), log = new Uint8Array(256);
         let val = 1;
         for (let i = 0; i < 255; i++) { exp[i] = val; log[val] = i; val <<= 1; if (val & 0x100) val ^= 285; }
         for (let i = 255; i < 512; i++) exp[i] = exp[i-255];
-        
         const gfMul = (a, b) => (a === 0 || b === 0) ? 0 : exp[log[a] + log[b]];
 
         function corregirErroresReedSolomonReal(msg, nCorr) {
@@ -206,12 +217,10 @@
             }
             if (!err) return msg.slice(0, msg.length - nCorr);
 
-            // Algoritmo Berlekamp-Massey completo incorporado para resolver localizaciones
             let C = new Array(nCorr + 1).fill(0), B = new Array(nCorr + 1).fill(0); C[0] = 1; B[0] = 1;
             let L = 0, m = 1, b = 1;
             for (let i = 0; i < nCorr; i++) {
-                let d = syn[i];
-                for (let j = 1; j <= L; j++) d ^= gfMul(C[j], syn[i - j]);
+                let d = syn[i]; for (let j = 1; j <= L; j++) d ^= gfMul(C[j], syn[i - j]);
                 if (d === 0) m++;
                 else {
                     let T = [...C]; let coef = gfMul(d, exp[255 - log[b]]);
@@ -219,7 +228,6 @@
                     if (2 * L <= i) { L = i + 1 - L; B = T; b = d; m = 1; } else m++;
                 }
             }
-            // Localizar raíces mediante búsqueda de Chien y reparar magnitudes con Forney
             let raices = [];
             for (let i = 0; i < 255; i++) {
                 let evalC = 0; for (let j = 0; j <= L; j++) evalC ^= gfMul(C[j], exp[(j * i) % 255]);
@@ -239,7 +247,7 @@
             let modo = (bytes[0] >> 4) & 0x0F;
             let len = ((bytes[0] & 0x0F) << 4) | ((bytes[1] >> 4) & 0x0F);
             let res = "", bitIdx = 12;
-            if (modo !== 4) return "Modo no soportado (usa texto estándar)"; // Filtro modo Byte
+            if (modo !== 4) return "Modo no soportado (usa texto estándar)"; 
             for (let i = 0; i < len; i++) {
                 let b = 0;
                 for (let j = 0; j < 8; j++) {
@@ -263,7 +271,6 @@
                 const { topLeft, topRight, bottomLeft } = marcadores;
                 const bottomRight = { x: topRight.x - topLeft.x + bottomLeft.x, y: topRight.y - topLeft.y + bottomLeft.y };
                 
-                // Módulo v1 estándar matemático = 21 módulos
                 const homografia = calcularMatrizPerspectiva(topLeft, topRight, bottomRight, bottomLeft, 21);
                 const grid = extraerCuadricula(bin, w, h, homografia, 21);
                 
